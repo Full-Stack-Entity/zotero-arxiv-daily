@@ -1,12 +1,61 @@
 """Tests for zotero_arxiv_daily.executor: normalize_path_patterns, filter_corpus, fetch_zotero_corpus, E2E."""
 
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 from omegaconf import OmegaConf
 
 from zotero_arxiv_daily.executor import Executor, normalize_path_patterns
 from zotero_arxiv_daily.protocol import CorpusPaper
+
+
+@pytest.mark.parametrize("limit", [1, 7, 15, 30, 350])
+def test_dynamic_limit_enriches_only_ranked_selection(config, monkeypatch, limit):
+    from tests.canned_responses import make_sample_paper
+    from zotero_arxiv_daily.protocol import Paper
+
+    config.executor.max_paper_num = limit
+    candidates = [make_sample_paper(title=f"Paper {i}", score=i, full_text=None) for i in range(300)]
+    enriched, summarized, sent = [], [], []
+
+    def rank(papers, corpus):
+        assert len(papers) == 300
+        assert not enriched
+        assert all(p.full_text is None for p in papers)
+        return sorted(papers, key=lambda p: p.score, reverse=True)
+
+    def enrich(paper):
+        enriched.append(paper.title)
+        if paper.score == 299:
+            raise requests.exceptions.Timeout("single-paper timeout")
+        paper.full_text = "body"
+
+    import requests
+    executor = Executor.__new__(Executor)
+    executor.config = config
+    executor.fetch_zotero_corpus = lambda: ["seed"]
+    executor.filter_corpus = lambda corpus: corpus
+    executor.reranker = SimpleNamespace(rerank=rank)
+    executor.retrievers = {"arxiv": SimpleNamespace(retrieve_papers=lambda: candidates, enrich_paper=enrich)}
+    executor.openai_client = None
+    monkeypatch.setattr(Paper, "generate_tldr", lambda p, *args: summarized.append(p.title))
+    monkeypatch.setattr(Paper, "generate_affiliations", lambda *args: None)
+    monkeypatch.setattr("zotero_arxiv_daily.executor.render_email", lambda papers: [p.title for p in papers])
+    monkeypatch.setattr("zotero_arxiv_daily.executor.send_email", lambda cfg, body: sent.append(body))
+    executor.run()
+    expected = [f"Paper {i}" for i in range(299, max(-1, 299 - limit), -1)]
+    assert enriched == summarized == expected
+    assert sent == [expected]
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5, "ten"])
+def test_invalid_limit_rejected(config, limit):
+    config.executor.max_paper_num = limit
+    executor = Executor.__new__(Executor)
+    executor.config = config
+    with pytest.raises(ValueError, match="max_paper_num"):
+        executor.run()
 
 
 # ---------------------------------------------------------------------------

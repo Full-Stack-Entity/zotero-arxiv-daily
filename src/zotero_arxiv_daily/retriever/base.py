@@ -9,6 +9,7 @@ from loguru import logger
 
 class BaseRetriever(ABC):
     name: str
+    conversion_delay = 1
     def __init__(self, config:DictConfig):
         self.config = config
         self.retriever_config = getattr(config.source,self.name)
@@ -20,6 +21,9 @@ class BaseRetriever(ABC):
     @abstractmethod
     def convert_to_paper(self, raw_paper:RawPaperItem) -> Paper | None:
         pass
+
+    def enrich_paper(self, paper: Paper) -> None:
+        """Optionally fetch extra content after ranking (arXiv only)."""
 
     def retrieve_papers(self) -> list[Paper]:
         raw_papers = self._retrieve_raw_papers()
@@ -33,7 +37,8 @@ class BaseRetriever(ABC):
                 continue
             if paper is not None:
                 papers.append(paper)
-            sleep(1)
+            if self.conversion_delay:
+                sleep(self.conversion_delay)
         return papers
 
 registered_retrievers = {}

@@ -91,6 +91,9 @@ class Executor:
 
     
     def run(self):
+        limit = self.config.executor.max_paper_num
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("executor.max_paper_num must be a positive integer")
         corpus = self.fetch_zotero_corpus()
         corpus = self.filter_corpus(corpus)
         if len(corpus) == 0:
@@ -110,7 +113,13 @@ class Executor:
         if len(all_papers) > 0:
             logger.info("Reranking papers...")
             reranked_papers = self.reranker.rerank(all_papers, corpus)
-            reranked_papers = reranked_papers[:self.config.executor.max_paper_num]
+            reranked_papers = reranked_papers[:limit]
+            logger.info(f"Selected {len(reranked_papers)} of {len(all_papers)} candidates (max_paper_num={limit}); enriching selected papers")
+            for p in tqdm(reranked_papers, desc="Enriching selected papers"):
+                try:
+                    self.retrievers[p.source].enrich_paper(p)
+                except Exception as exc:
+                    logger.warning(f"Content enrichment failed for {p.url}: {exc}; using available abstract")
             logger.info("Generating TLDR and affiliations...")
             for p in tqdm(reranked_papers):
                 p.generate_tldr(self.openai_client, self.config.llm)

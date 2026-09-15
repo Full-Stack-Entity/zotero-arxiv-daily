@@ -5,7 +5,6 @@ from ..protocol import Paper
 from ..utils import extract_markdown_from_pdf, extract_tex_code_from_tar
 from tempfile import TemporaryDirectory
 import feedparser
-from tqdm import tqdm
 import multiprocessing
 import os
 from queue import Empty
@@ -13,12 +12,98 @@ from time import sleep
 from typing import Any, Callable, TypeVar
 from loguru import logger
 import requests
+import re
+import math
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
+from random import uniform
+from time import monotonic
 
 T = TypeVar("T")
 
 DOWNLOAD_TIMEOUT = (10, 60)
 PDF_EXTRACT_TIMEOUT = 180
 TAR_EXTRACT_TIMEOUT = 180
+HTML_EXTRACT_TIMEOUT = 60
+FEED_MAX_ATTEMPTS = 5
+FEED_RETRY_BUDGET = 300
+
+
+class _TextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag in {"br", "p", "div", "li"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"p", "div", "li"}:
+            self.parts.append("\n")
+
+
+def _entry_text(entry: dict, field: str) -> str:
+    value = entry.get(field, "")
+    if entry.get(f"{field}_detail", {}).get("type") in {"text/html", "application/xhtml+xml"}:
+        parser = _TextParser()
+        parser.feed(value)
+        value = "".join(parser.parts)
+    return value.strip()
+
+
+def _retry_after(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            seconds = (date - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return 0
+    return max(0, seconds) if math.isfinite(seconds) else 0
+
+
+def _fetch_feed(url: str) -> feedparser.FeedParserDict:
+    """One bounded retry layer; malformed feeds must not masquerade as empty days."""
+    deadline = monotonic() + FEED_RETRY_BUDGET
+    for attempt in range(FEED_MAX_ATTEMPTS):
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise TimeoutError("arXiv feed retry budget exhausted")
+        try:
+            with requests.get(
+                url,
+                headers={"User-Agent": "zotero-arxiv-daily/1.0 (arXiv daily recommendations)"},
+                timeout=(min(10, remaining / 2), min(45, remaining / 2)),
+            ) as response:
+                response.raise_for_status()
+                feed = feedparser.parse(response.content)
+            if feed.get("bozo") or feed.get("version") != "atom10" or not feed.feed.get("title"):
+                raise ValueError("Invalid arXiv Atom feed; refusing to report no new papers")
+            if "Feed error for query" in feed.feed.title:
+                raise ValueError(f"Invalid arXiv category query: {url}")
+            return feed
+        except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as exc:
+            response = exc.response
+            status = response.status_code if response is not None else None
+            if status is not None and status not in {429, 500, 502, 503, 504}:
+                raise
+            wait = 15 * 2 ** attempt + uniform(0, 3)
+            if response is not None:
+                wait = max(wait, _retry_after(response.headers.get("Retry-After", "")))
+            if attempt + 1 == FEED_MAX_ATTEMPTS or wait >= deadline - monotonic():
+                logger.error(f"arXiv feed failed: HTTP {status or type(exc).__name__}; retry count or time budget exhausted")
+                raise
+            logger.warning(f"arXiv feed HTTP {status or type(exc).__name__}, retry {attempt + 1}/{FEED_MAX_ATTEMPTS} in {wait:.1f}s")
+            sleep(wait)
+    raise RuntimeError("arXiv feed request failed")
 
 
 def _download_file(url: str, path: str) -> None:
@@ -108,52 +193,60 @@ def _extract_text_from_tar_worker(source_url: str, paper_id: str, paper_title: s
 
 @register_retriever("arxiv")
 class ArxivRetriever(BaseRetriever):
+    conversion_delay = 0  # Metadata conversion is local; no per-paper network requests.
+
     def __init__(self, config):
         super().__init__(config)
         if self.config.source.arxiv.category is None:
             raise ValueError("category must be specified for arxiv.")
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        client = arxiv.Client(num_retries=10, delay_seconds=10)
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
-        # Get the latest paper from arxiv rss feed
-        feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
-        if 'Feed error for query' in feed.feed.title:
-            raise Exception(f"Invalid ARXIV_QUERY: {query}.")
+        feed = _fetch_feed(f"https://rss.arxiv.org/atom/{query}")
         raw_papers = []
         allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
-        all_paper_ids = [
-            i.id.removeprefix("oai:arXiv.org:")
-            for i in feed.entries
+        entries = [
+            i for i in feed.entries
             if i.get("arxiv_announce_type", "new") in allowed_announce_types
         ]
-        if self.config.executor.debug:
-            all_paper_ids = all_paper_ids[:10]
-
-        # Get full information of each paper from arxiv api
-        bar = tqdm(total=len(all_paper_ids))
-        max_batch_retries = 5
-        batch_retry_delay = 30
-        for i in range(0, len(all_paper_ids), 20):
-            search = arxiv.Search(id_list=all_paper_ids[i:i + 20])
-            for attempt in range(max_batch_retries):
-                try:
-                    batch = list(client.results(search))
-                    bar.update(len(batch))
-                    raw_papers.extend(batch)
-                    break
-                except arxiv.HTTPError as exc:
-                    if exc.status == 429 and attempt < max_batch_retries - 1:
-                        wait = batch_retry_delay * (attempt + 1)
-                        logger.warning(f"arXiv API 429 on batch {i // 20}, retry {attempt + 1}/{max_batch_retries} in {wait}s")
-                        sleep(wait)
-                    else:
-                        raise
-            if i + 20 < len(all_paper_ids):
-                sleep(3)
-        bar.close()
-
+        seen = set()
+        skipped = 0
+        for entry in entries:
+            pid = entry.get("id", "").removeprefix("oai:arXiv.org:")
+            if not re.fullmatch(r"(?:\d{4}\.\d{4,5}|[a-z][a-z.-]*/\d{7})(?:v[1-9]\d*)?", pid):
+                logger.warning(f"Skipping invalid arXiv ID: {pid!r}")
+                skipped += 1
+                continue
+            key = re.sub(r"v\d+$", "", pid)
+            if key in seen:
+                continue
+            title = _entry_text(entry, "title")
+            abstract = _entry_text(entry, "summary")
+            abstract = re.sub(r"^arXiv:\S+\s+Announce Type:\s*\S+\s+Abstract:\s*", "", abstract, count=1).strip()
+            authors = [
+                arxiv.Result.Author(name.strip())
+                for author in entry.get("authors", [])
+                for name in author.get("name", "").split(",")
+                if name.strip()
+            ]
+            if not title or not abstract or not authors:
+                logger.warning(f"Skipping arXiv {pid}: missing title, abstract or authors in feed")
+                skipped += 1
+                continue
+            seen.add(key)
+            raw_papers.append(ArxivResult(
+                entry_id=f"https://arxiv.org/abs/{pid}",
+                title=title,
+                summary=abstract,
+                authors=authors,
+                links=[ArxivResult.Link(f"https://arxiv.org/pdf/{pid}", title="pdf")],
+            ))
+            if self.config.executor.debug and len(raw_papers) == 10:
+                break
+        logger.info(f"arXiv feed: {len(feed.entries)} entries, {len(raw_papers)} candidates, {skipped} invalid entries skipped")
+        if entries and not raw_papers:
+            raise ValueError("All eligible arXiv feed entries are invalid; refusing to report no new papers")
         return raw_papers
 
     def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
@@ -161,11 +254,6 @@ class ArxivRetriever(BaseRetriever):
         authors = [a.name for a in raw_paper.authors]
         abstract = raw_paper.summary
         pdf_url = raw_paper.pdf_url
-        full_text = extract_text_from_tar(raw_paper)
-        if full_text is None:
-            full_text = extract_text_from_html(raw_paper)
-        if full_text is None:
-            full_text = extract_text_from_pdf(raw_paper)
         return Paper(
             source=self.name,
             title=title,
@@ -173,17 +261,31 @@ class ArxivRetriever(BaseRetriever):
             abstract=abstract,
             url=raw_paper.entry_id,
             pdf_url=pdf_url,
-            full_text=full_text,
         )
+
+    def enrich_paper(self, paper: Paper) -> None:
+        if paper.full_text:
+            return
+        raw_paper = ArxivResult(
+            entry_id=paper.url, title=paper.title,
+            links=[ArxivResult.Link(paper.pdf_url, title="pdf")] if paper.pdf_url else [],
+        )
+        for extract in (extract_text_from_tar, extract_text_from_html, extract_text_from_pdf):
+            paper.full_text = extract(raw_paper)
+            if paper.full_text:
+                return
+        logger.warning(f"No full text for {paper.url}; generating TLDR from abstract")
 
 
 def extract_text_from_html(paper: ArxivResult) -> str | None:
     html_url = paper.entry_id.replace("/abs/", "/html/")
-    try:
-        return _extract_text_from_html_worker(html_url)
-    except Exception as exc:
-        logger.warning(f"HTML extraction failed for {paper.title}: {exc}")
-        return None
+    return _run_with_hard_timeout(
+        _extract_text_from_html_worker,
+        (html_url,),
+        timeout=HTML_EXTRACT_TIMEOUT,
+        operation="HTML extraction",
+        paper_title=paper.title,
+    )
 
 
 def extract_text_from_pdf(paper: ArxivResult) -> str | None:
